@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	gonanoid "github.com/matoous/go-nanoid/v2"
 	"io"
 	"log"
@@ -33,16 +34,14 @@ func GetSinkInputs() ([]*SinkInput, error) {
 // StreamAudio streams audio from the specified sink input ID over HTTP.
 func StreamAudio(w http.ResponseWriter, r *http.Request, input *SinkInput) {
 	w.Header().Set("Content-Type", "audio/mpeg")
-
 	id := gonanoid.Must(8)
-
-	var cancel context.CancelFunc
 	iteration := 0
 	requestContext := r.Context()
 	sinkInputChan := notifyForNewSinkID(requestContext, input)
 
 	slog.Info("Starting audio stream", slog.String("id", id))
 
+	var cancel context.CancelFunc
 	for {
 		iteration++
 		select {
@@ -50,83 +49,94 @@ func StreamAudio(w http.ResponseWriter, r *http.Request, input *SinkInput) {
 			if cancel != nil {
 				cancel()
 			}
+
+			slog.Info("End audio stream", slog.String("id", id))
 			return
 		case newInput := <-sinkInputChan:
-			if iteration > 1 && input.ID == newInput.ID {
-				// when it's above the first iteration, and the new input ID is the same as the current one,
-				// we skip the iteration
-				continue
-			}
-
 			if cancel != nil {
-				cancel()
+				cancel() // Cancel the previous context
 			}
-
 			input = newInput
-
-			slog.Info("Using sink input", slog.String("id", id), slog.Int("sinkID", input.ID))
-
-			// Start a new context for the new sink input ID
-			var newCtx context.Context
-			newCtx, cancel = context.WithCancel(requestContext)
-
-			go func(sinkID int, iteration int, ctx context.Context) {
-				logContext := slog.GroupValue(
-					slog.Int("sinkID", sinkID),
-					slog.Int("iteration", iteration),
-					slog.String("id", id))
-
-				parecCmd := exec.CommandContext(ctx, "parec", "--monitor-stream="+strconv.Itoa(sinkID))
-				parecOut, err := parecCmd.StdoutPipe()
-				if err != nil {
-					slog.Info("Failed to start parec: %v",
-						logContext,
-						slog.String("error", err.Error()))
-
-					return
-				}
-
-				if err := parecCmd.Start(); err != nil {
-					slog.Info("Failed to start parec: %v",
-						logContext,
-						slog.String("error", err.Error()))
-					return
-				}
-
-				// Start lame process
-				lameCmd := exec.CommandContext(ctx, "lame", "-r", "-", "-")
-				lameCmd.Stdin = parecOut
-				lameOut, err := lameCmd.StdoutPipe()
-				if err != nil {
-					slog.Info("Failed to start lame: %v",
-						logContext,
-						slog.String("error", err.Error()))
-					return
-				}
-
-				if err := lameCmd.Start(); err != nil {
-					slog.Info("Failed to start lame: %v",
-						logContext,
-						slog.String("error", err.Error()))
-					return
-				}
-
-				ctxReader := newContextReader(ctx, lameOut)
-
-				// Stream the audio to the HTTP response writer
-				_, err = io.Copy(w, ctxReader)
-				if err != nil {
-					slog.Info("Failed to stream audio: %v",
-						logContext,
-						slog.String("error", err.Error()))
-				}
-
-				// Clean up the processes
-				parecCmd.Process.Kill()
-				lameCmd.Process.Kill()
-			}(input.ID, iteration, newCtx)
-
+			cancelCtx, newCancel := context.WithCancel(requestContext)
+			cancel = newCancel
+			handleNewSinkInput(cancelCtx, w, input, id, iteration)
 		}
+	}
+
+}
+
+// handleNewSinkInput handles the new sink input ID and starts streaming audio.
+func handleNewSinkInput(
+	parentCtx context.Context,
+	w http.ResponseWriter,
+	input *SinkInput,
+	id string,
+	iteration int,
+) {
+	logContext := slog.Group("context",
+		slog.Int("sink_id", input.ID),
+		slog.Int("iteration", iteration),
+		slog.String("id", id))
+
+	go startAudioStreaming(parentCtx, w, input.ID, logContext)
+
+	slog.Info("Stop audio stream", logContext)
+}
+
+// startAudioStreaming starts the audio streaming process.
+func startAudioStreaming(ctx context.Context, w http.ResponseWriter, sinkID int, logContext slog.Attr) {
+	recordOut, err := startRecordProcess(ctx, sinkID)
+	if err != nil {
+		slog.Error("Failed to start record process", logContext, slog.String("error", err.Error()))
+		return
+	}
+
+	encodingOut, err := startEncodingProcess(ctx, recordOut)
+	if err != nil {
+		slog.Error("Failed to start encoding process", logContext, slog.String("error", err.Error()))
+		return
+	}
+
+	streamAudioToResponse(ctx, w, encodingOut, logContext)
+}
+
+// startRecordProcess starts the parec process and returns the stdout pipe.
+func startRecordProcess(ctx context.Context, sinkID int) (io.ReadCloser, error) {
+	recordCmd := exec.CommandContext(ctx, "parec", "--monitor-stream="+strconv.Itoa(sinkID))
+	recordOut, err := recordCmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get parec stdout pipe: %w", err)
+	}
+	if err := recordCmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start parec process: %w", err)
+	}
+	return recordOut, nil
+}
+
+// startEncodingProcess starts the lame process and returns the stdout pipe.
+func startEncodingProcess(ctx context.Context, recordOut io.ReadCloser) (io.ReadCloser, error) {
+	encodingCmd := exec.CommandContext(ctx, "lame", "-r", "-", "-")
+	encodingCmd.Stdin = recordOut
+	encodingOut, err := encodingCmd.StdoutPipe()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get lame stdout pipe: %w", err)
+	}
+	if err := encodingCmd.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start lame process: %w", err)
+	}
+	return encodingOut, nil
+}
+
+// streamAudioToResponse streams the audio from the encoding process to the HTTP response writer.
+func streamAudioToResponse(
+	ctx context.Context,
+	w http.ResponseWriter,
+	encodingOut io.ReadCloser,
+	logContext slog.Attr,
+) {
+	ctxReader := newContextReader(ctx, encodingOut)
+	if _, err := io.Copy(w, ctxReader); err != nil {
+		slog.Error("Failed to stream audio", logContext, slog.String("error", err.Error()))
 	}
 }
 
